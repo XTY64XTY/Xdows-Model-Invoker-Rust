@@ -1,0 +1,10 @@
+/target/
+/.tools/
+
+# Runtime assets are supplied by Xdows-Model and are not redistributed here.
+*.dll
+*.exp
+*.lib
+*.onnx
+*.threshold.json
+

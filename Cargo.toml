@@ -1,0 +1,20 @@
+[package]
+name = "xdows-model-invoker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Safe Rust bindings for Standard, Flash, Pro, and Adaptive Xdows-Model inference"
+license = "MIT"
+repository = "https://github.com/XTY64XTY/Xdows-Model-Invoker-Rust"
+readme = "README.md"
+keywords = ["onnx", "malware", "inference", "windows"]
+categories = ["api-bindings"]
+
+[lib]
+name = "xdows_model_invoker"
+path = "src/lib.rs"
+
+[[example]]
+name = "scan"
+path = "examples/scan.rs"
+
