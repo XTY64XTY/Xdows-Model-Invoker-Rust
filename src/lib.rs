@@ -10,10 +10,12 @@
 mod error;
 mod ffi;
 mod mode;
+mod models;
 mod session;
 
 pub use error::{Error, NativeStatus, Result};
 pub use mode::ModelMode;
+pub use models::{for_mode as models_for_mode, ModelAsset};
 pub use session::{ModelInvoker, ModelLibrary, ScanResult};
 
 /// The file name exported by the Xdows-Model native project.

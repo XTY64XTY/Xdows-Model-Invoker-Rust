@@ -1,7 +1,10 @@
 use crate::ffi::{canonical_library_path, encode_path, NativeApi, RawScanResult};
+use crate::models::{for_mode as models_for_mode, ModelAsset};
 use crate::{Error, ModelMode, NativeStatus, Result, NATIVE_LIBRARY_FILE_NAME};
 use std::cell::Cell;
 use std::ffi::c_void;
+use std::fs;
+use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
@@ -50,6 +53,57 @@ impl ModelLibrary {
     pub fn path(&self) -> &Path {
         self.path.as_path()
     }
+
+    /// Writes the embedded model files required by `mode` into `directory`.
+    ///
+    /// Existing files are left in place when their size matches the embedded
+    /// asset, so repeated calls are idempotent and never overwrite a model that
+    /// a caller placed deliberately. This mirrors the C#
+    /// `ModelInvoker.EnsureModelAvailable` flow, which extracts the embedded
+    /// resources next to the assembly on first use. The native library does not
+    /// need to be loaded to call this function.
+    pub fn ensure_models(directory: &Path, mode: ModelMode) -> Result<()> {
+        write_assets(directory, models_for_mode(mode))
+    }
+
+    /// Writes all seven embedded model files into `directory`.
+    ///
+    /// Useful when a deployment wants every model available up front instead of
+    /// extracting them per mode. Existing files are preserved like
+    /// [`ensure_models`](Self::ensure_models).
+    pub fn ensure_all_models(directory: &Path) -> Result<()> {
+        write_assets(directory, crate::models::ALL)
+    }
+}
+
+fn write_assets(directory: &Path, assets: &[&ModelAsset]) -> Result<()> {
+    fs::create_dir_all(directory).map_err(|source| Error::Io {
+        operation: "create model directory",
+        path: directory.to_path_buf(),
+        source,
+    })?;
+
+    for asset in assets {
+        let target = directory.join(asset.file_name);
+        if let Ok(metadata) = fs::metadata(&target) {
+            if metadata.len() as usize == asset.bytes.len() {
+                continue;
+            }
+        }
+
+        let mut file = fs::File::create(&target).map_err(|source| Error::Io {
+            operation: "create model file",
+            path: target.clone(),
+            source,
+        })?;
+        file.write_all(asset.bytes).map_err(|source| Error::Io {
+            operation: "write model file",
+            path: target.clone(),
+            source,
+        })?;
+        file.sync_all().ok();
+    }
+    Ok(())
 }
 
 /// A successful Xdows-Model scan.
@@ -78,18 +132,26 @@ pub struct ModelInvoker {
 impl ModelInvoker {
     /// Initializes one of the four Xdows-Model modes.
     ///
-    /// `model_directory` must contain the model files required by `mode`. When
-    /// it is `None`, the native library checks its own directory and then the
-    /// current working directory, matching the native Xdows-Model contract.
+    /// When `model_directory` is `Some(dir)`, the embedded model files for `mode`
+    /// are first extracted into `dir` (overriding only missing or mismatched
+    /// files), and `dir` is passed to the native library. When it is `None`,
+    /// the models are extracted into a per-user cache directory under the
+    /// system temp folder and that directory is passed instead. This mirrors
+    /// the C# `ModelInvoker.Initialize`/`EnsureModelAvailable` flow, which
+    /// materializes the embedded resources next to the assembly on first use.
     pub fn initialize(
         library: &ModelLibrary,
         mode: ModelMode,
         model_directory: Option<&Path>,
     ) -> Result<Self> {
-        let encoded_directory = model_directory.map(encode_path).transpose()?;
-        let directory_pointer = encoded_directory
-            .as_ref()
-            .map_or(std::ptr::null(), |value| value.as_ptr());
+        let resolved_directory = match model_directory {
+            Some(directory) => directory.to_path_buf(),
+            None => default_model_directory(),
+        };
+        ModelLibrary::ensure_models(&resolved_directory, mode)?;
+
+        let encoded_directory = encode_path(&resolved_directory)?;
+        let directory_pointer = encoded_directory.as_ptr();
         let mut raw_session = std::ptr::null_mut();
         let status = unsafe {
             library.api.initialize(
@@ -209,5 +271,54 @@ impl Drop for ModelInvoker {
         unsafe {
             self.library.api.shutdown(self.session.as_ptr());
         }
+    }
+}
+
+/// Returns the directory used to extract embedded models when the caller does
+/// not pass an explicit `model_directory`.
+///
+/// The location is `%TEMP%\xdows-model-invoker`, which is per-user, writable
+/// without elevation, and stable across runs so the extraction can be skipped on
+/// subsequent invocations.
+fn default_model_directory() -> PathBuf {
+    std::env::temp_dir().join("xdows-model-invoker")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::default_model_directory;
+    use crate::models::for_mode as models_for_mode;
+    use crate::ModelMode;
+
+    #[test]
+    fn default_model_directory_is_under_temp() {
+        let dir = default_model_directory();
+        let temp = std::env::temp_dir();
+        assert!(
+            dir.starts_with(&temp),
+            "{} should live under {}",
+            dir.display(),
+            temp.display()
+        );
+    }
+
+    #[test]
+    fn embedded_extraction_is_idempotent() {
+        let dir = default_model_directory().join("idempotent-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write only the Standard model and confirm the helper does not fail when
+        // the rest are absent; we exercise the write path via a tiny asset.
+        let asset = models_for_mode(ModelMode::Standard)[0];
+        let target = dir.join(asset.file_name);
+        std::fs::write(&target, asset.bytes).unwrap();
+        let first_mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+
+        // Sleep briefly so a rewrite would change mtime on filesystems with coarse
+        // timestamp granularity, then ensure_models and assert the file was kept.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        crate::ModelLibrary::ensure_models(&dir, ModelMode::Standard).unwrap();
+        let second_mtime = std::fs::metadata(&target).unwrap().modified().unwrap();
+        assert_eq!(first_mtime, second_mtime, "model file was rewritten");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

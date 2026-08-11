@@ -1,10 +1,13 @@
 /target/
 /.tools/
 
-# Runtime assets are supplied by Xdows-Model and are not redistributed here.
+# Runtime assets supplied by Xdows-Model are not redistributed here.
 *.dll
 *.exp
 *.lib
-*.onnx
 *.threshold.json
 
+# ONNX models are embedded into the crate via include_bytes! and tracked here.
+# Ignore stray runtime ONNX files everywhere except the bundled models/ directory.
+*.onnx
+!models/*.onnx

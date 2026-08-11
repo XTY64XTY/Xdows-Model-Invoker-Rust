@@ -4,13 +4,26 @@
 
 接口生命周期参考 `Xdows-Model/Xdows-Model-Invoker` 中的 C# `ModelInvoker`：加载运行库、初始化模型、复用会话扫描多个文件，最后自动释放模型。底层通过 `Xdows-Model-Native.dll` 的稳定 C ABI 调用官方特征提取和 ONNX 推理实现，Rust 代码不复制模型特征算法。
 
+## 内置模型
+
+与 C# 调用器一致，七个 ONNX 模型以 `include_bytes!` 编译期内置在本 crate 中，镜像 `Xdows-Model-Invoker.csproj` 的 `EmbeddedResource` 条目：
+
+- `Xdows-Model.onnx`
+- `Xdows-Model-Flash.onnx`
+- `Xdows-Model-Pro.onnx`
+- `Xdows-Model-Pro-Standard.onnx`
+- `Xdows-Model-Pro-Flash.onnx`
+- `Xdows-Model-Pro-RawStat.onnx`
+- `Xdows-Model-Pro-Structural.onnx`
+
+源文件位于仓库 [`models/`](models) 目录。调用 `ModelInvoker::initialize` 时，所需模型会自动写入目标目录（已存在且大小匹配的文件会保留），因此部署侧只需提供 `Xdows-Model-Native.dll` 及其 ONNX Runtime 依赖，无需单独分发 ONNX 文件。`ModelLibrary::ensure_models` / `ensure_all_models` 也可单独调用以提前落盘。
+
 ## 要求
 
 - Windows x64 或 ARM64
 - Rust 1.74 或更高版本
 - 从 Xdows-Model 构建的 `Xdows-Model-Native.dll`
 - 与原生库架构一致的 ONNX Runtime DLL
-- 对应模式的 Xdows-Model ONNX 文件
 
 运行目录应至少包含：
 
@@ -18,17 +31,10 @@
 runtime/
 |-- Xdows-Model-Native.dll
 |-- onnxruntime.dll
-|-- onnxruntime_providers_shared.dll
-|-- Xdows-Model.onnx
-|-- Xdows-Model-Flash.onnx
-|-- Xdows-Model-Pro.onnx
-|-- Xdows-Model-Pro-Standard.onnx
-|-- Xdows-Model-Pro-Flash.onnx
-|-- Xdows-Model-Pro-RawStat.onnx
-`-- Xdows-Model-Pro-Structural.onnx
+`-- onnxruntime_providers_shared.dll
 ```
 
-Standard 只需要 `Xdows-Model.onnx`，Flash 只需要 `Xdows-Model-Flash.onnx`。Pro 使用 519 维单模型时只需要主模型；使用 4 维融合模型时还需要四个分支模型。Adaptive 需要 Standard、Flash 和 Pro 所需的全部模型。
+ONNX 模型由本 crate 内置，无需单独放置。
 
 ## 使用
 
@@ -38,6 +44,7 @@ use xdows_model_invoker::{ModelInvoker, ModelLibrary};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let library = ModelLibrary::load_from_directory("runtime")?;
+    // 模型自动从内置字节提取到 "runtime"，无需手动准备 ONNX 文件。
     let model = ModelInvoker::pro(&library, Some(Path::new("runtime")))?;
 
     for file in ["samples/one.exe", "samples/two.exe"] {
@@ -81,6 +88,17 @@ let model = ModelInvoker::initialize(library, mode, Some(model_dir))?;
 # }
 ```
 
+`model_directory` 传 `None` 时，模型会提取到 `%TEMP%\xdows-model-invoker` 并在该目录初始化，便于无需指定输出目录的快速调用：
+
+```rust
+# use xdows_model_invoker::{ModelInvoker, ModelLibrary, ModelMode};
+# fn example(library: &ModelLibrary) -> xdows_model_invoker::Result<()> {
+let model = ModelInvoker::initialize(library, ModelMode::Adaptive, None)?;
+# drop(model);
+# Ok(())
+# }
+```
+
 命令行示例：
 
 ```powershell
@@ -99,7 +117,7 @@ cargo run --example scan -- `
 
 ## 验证
 
-常规检查不需要模型文件：
+常规检查不需要原生运行库：
 
 ```powershell
 cargo fmt --check
@@ -107,7 +125,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
-准备好原生运行库、模型和 PE 样本后，可运行四模式真实冒烟测试：
+准备好原生运行库与 PE 样本后，可运行四模式真实冒烟测试（模型已内置，无需设置模型目录）：
 
 ```powershell
 $env:XDOWS_NATIVE_DLL = "D:\runtime\Xdows-Model-Native.dll"
