@@ -3,6 +3,7 @@ use crate::models::{for_mode as models_for_mode, ModelAsset};
 use crate::{Error, ModelMode, NativeStatus, Result, NATIVE_LIBRARY_FILE_NAME};
 use std::cell::Cell;
 use std::ffi::c_void;
+use std::fmt;
 use std::fs;
 use std::io::Write;
 use std::marker::PhantomData;
@@ -106,10 +107,56 @@ fn write_assets(directory: &Path, assets: &[&ModelAsset]) -> Result<()> {
     Ok(())
 }
 
+/// The three-tier classification produced by Xdows-Model.
+///
+/// `Malware` means the probability reached the fixed threshold,
+/// `Suspicious` means it reached the model's recommended threshold,
+/// and `Clean` covers everything below the recommended threshold.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+#[repr(i32)]
+pub enum ScanVerdict {
+    /// Probability is below the recommended threshold.
+    #[default]
+    Clean = 0,
+    /// Probability is at or above the recommended threshold but below the fixed threshold.
+    Suspicious = 1,
+    /// Probability is at or above the fixed threshold.
+    Malware = 2,
+}
+
+impl ScanVerdict {
+    /// Returns the stable integer representation used by the native ABI.
+    pub const fn as_raw(self) -> i32 {
+        self as i32
+    }
+
+    /// Converts the integer ABI representation into a typed verdict.
+    pub const fn from_raw(code: i32) -> Option<Self> {
+        match code {
+            0 => Some(Self::Clean),
+            1 => Some(Self::Suspicious),
+            2 => Some(Self::Malware),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for ScanVerdict {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Clean => "Clean",
+            Self::Suspicious => "Suspicious",
+            Self::Malware => "Malware",
+        })
+    }
+}
+
 /// A successful Xdows-Model scan.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScanResult {
-    /// Whether the selected model classified the file as a threat.
+    /// The three-tier verdict assigned by the native library.
+    pub verdict: ScanVerdict,
+    /// Whether the selected model classified the file as a threat (anything but `Clean`).
     pub is_threat: bool,
     /// Threat probability in the inclusive `0.0..=100.0` range.
     pub probability: f32,
@@ -248,6 +295,8 @@ impl ModelInvoker {
         if raw_result.is_threat != 0 && raw_result.is_threat != 1 {
             return Err(Error::InvalidNativeResult("IsThreat is not 0 or 1"));
         }
+        let verdict = ScanVerdict::from_raw(raw_result.verdict)
+            .ok_or(Error::InvalidNativeResult("Verdict is not 0, 1, or 2"))?;
         if !raw_result.probability.is_finite() || !(0.0..=100.0).contains(&raw_result.probability) {
             return Err(Error::InvalidNativeResult(
                 "Probability is not a finite percentage",
@@ -255,6 +304,7 @@ impl ModelInvoker {
         }
 
         Ok(ScanResult {
+            verdict,
             is_threat: raw_result.is_threat == 1,
             probability: raw_result.probability,
             detection_name,

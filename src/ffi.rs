@@ -11,6 +11,7 @@ pub(crate) struct RawScanResult {
     pub probability: f32,
     pub detection_name: *mut u16,
     pub error_message: *mut u16,
+    pub verdict: i32,
 }
 
 impl Default for RawScanResult {
@@ -22,6 +23,7 @@ impl Default for RawScanResult {
             probability: 0.0,
             detection_name: std::ptr::null_mut(),
             error_message: std::ptr::null_mut(),
+            verdict: 0,
         }
     }
 }
@@ -325,9 +327,9 @@ mod tests {
     #[test]
     fn raw_result_has_expected_pointer_alignment() {
         let expected = if cfg!(target_pointer_width = "64") {
-            32
+            40
         } else {
-            24
+            28
         };
         assert_eq!(std::mem::size_of::<RawScanResult>(), expected);
     }

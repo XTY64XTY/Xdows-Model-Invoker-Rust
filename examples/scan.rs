@@ -19,6 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let result = invoker.scan_file(&arguments[4])?;
 
     println!("mode: {}", invoker.mode());
+    println!("verdict: {}", result.verdict);
     println!("threat: {}", result.is_threat);
     println!("probability: {:.2}%", result.probability);
     if let Some(name) = result.detection_name {

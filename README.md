@@ -50,7 +50,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for file in ["samples/one.exe", "samples/two.exe"] {
         let result = model.scan_file(file)?;
         println!(
-            "{file}: threat={}, probability={:.2}%, detection={:?}",
+            "{file}: verdict={}, threat={}, probability={:.2}%, detection={:?}",
+            result.verdict,
             result.is_threat,
             result.probability,
             result.detection_name
@@ -59,6 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+扫描结果 `ScanResult` 提供三档判定 `verdict`（`Clean` / `Suspicious` / `Malware`，对应 ABI 值 0/1/2，与 C# 与原生库语义一致）：概率达到固定阈值时为 `Malware`，介于推荐阈值与固定阈值之间时为 `Suspicious`，低于推荐阈值时为 `Clean`。`is_threat` 保留为旧语义的兼容视图（`Clean` 之外均为威胁）。
 
 四种便捷初始化方法分别为：
 
