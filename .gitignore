@@ -1,11 +1,17 @@
 /target/
 /.tools/
 
-# Runtime assets supplied by Xdows-Model are not redistributed here.
+# Native runtime binaries supplied by Xdows-Model are not redistributed here.
 *.dll
 *.exp
 *.lib
+
+# Model metadata is embedded into the crate via include_bytes! and tracked here.
+# The recommended-threshold manifests are part of the deployment contract: the
+# native library reads <model>.threshold.json to obtain the recommended
+# threshold that defines the Suspicious band, so they must ship with the models.
 *.threshold.json
+!models/*.threshold.json
 
 # ONNX models are embedded into the crate via include_bytes! and tracked here.
 # Ignore stray runtime ONNX files everywhere except the bundled models/ directory.

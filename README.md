@@ -6,17 +6,33 @@
 
 ## 内置模型
 
-与 C# 调用器一致，七个 ONNX 模型以 `include_bytes!` 编译期内置在本 crate 中，镜像 `Xdows-Model-Invoker.csproj` 的 `EmbeddedResource` 条目：
+与 `Xdows-Model-Invoker\Models\` 的部署集完全一致，**8 个 ONNX 模型 + 4 个 JSON 清单**以 `include_bytes!` 编译期内置在本 crate 中：
 
-- `Xdows-Model.onnx`
-- `Xdows-Model-Flash.onnx`
-- `Xdows-Model-Pro.onnx`
-- `Xdows-Model-Pro-Standard.onnx`
-- `Xdows-Model-Pro-Flash.onnx`
-- `Xdows-Model-Pro-RawStat.onnx`
-- `Xdows-Model-Pro-Structural.onnx`
+| 文件 | 用途 |
+| --- | --- |
+| `Xdows-Model.onnx` | Standard 主模型 |
+| `Xdows-Model.threshold.json` | Standard 推荐阈值 |
+| `Xdows-Model-Flash.onnx` | Flash 主模型 |
+| `Xdows-Model-Flash.threshold.json` | Flash 推荐阈值 |
+| `Xdows-Model-Pro.onnx` | Pro 融合模型（5 输入） |
+| `Xdows-Model-Pro.threshold.json` | Pro 推荐阈值 |
+| `Xdows-Model-Pro.manifest.json` | Pro 特征布局与分支清单 |
+| `Xdows-Model-Pro-Standard.onnx` | Pro Standard 分支 |
+| `Xdows-Model-Pro-Flash.onnx` | Pro Flash 分支 |
+| `Xdows-Model-Pro-RawStat.onnx` | Pro RawStat 分支 |
+| `Xdows-Model-Pro-Structural.onnx` | Pro Structural 分支 |
+| `Xdows-Model-Pro-ImportBehavior.onnx` | Pro ImportBehavior 分支 |
 
 源文件位于仓库 [`models/`](models) 目录。调用 `ModelInvoker::initialize` 时，所需模型会自动写入目标目录（已存在且大小匹配的文件会保留），因此部署侧只需提供 `Xdows-Model-Native.dll` 及其 ONNX Runtime 依赖，无需单独分发 ONNX 文件。`ModelLibrary::ensure_models` / `ensure_all_models` 也可单独调用以提前落盘。
+
+Pro 模式为**五分支 Stacking 集成**（Standard / Flash / RawStat / Structural / ImportBehavior），混合特征 5143 维，融合模型接受 5 个分支概率。旧的四分支 Pro 模型（519 维、4 输入融合、无清单）仍可通过原生库的兼容路径加载，本 crate 亦保留对应文件集。
+
+### 为什么清单也必须内置
+
+- `<model>.threshold.json` 决定三档判定的下界：原生库读取它得到**推荐阈值**，据此把概率划入 `Suspicious` 区间。若清单缺失，原生库静默回退到固定阈值，`Suspicious` 将永远不会出现——即使 API 仍然暴露该档位。
+- `Xdows-Model-Pro.manifest.json` 记录五分支的维度、偏移、文件顺序、特征布局指纹与导入哈希参数。托管调用器在加载五分支 Pro 模型时会强制校验它；本 crate 一并内置，以保证 Pro 模型集可整体部署，且与上游部署集逐文件对齐。
+
+> 原生库当前只解析 `<model>.threshold.json`，不解析 Pro 清单（它按融合模型输入维度判定代数）。清单在此的作用是保持部署集完整与上游一致。
 
 ## 要求
 
@@ -34,7 +50,7 @@ runtime/
 `-- onnxruntime_providers_shared.dll
 ```
 
-ONNX 模型由本 crate 内置，无需单独放置。
+ONNX 模型与清单由本 crate 内置，无需单独放置。
 
 ## 使用
 
@@ -91,9 +107,10 @@ let model = ModelInvoker::initialize(library, mode, Some(model_dir))?;
 # }
 ```
 
-`model_directory` 传 `None` 时，模型会提取到 `%TEMP%\xdows-model-invoker` 并在该目录初始化，便于无需指定输出目录的快速调用：
+`model_directory` 传 `None` 时，模型与清单会提取到 `%TEMP%\xdows-model-invoker` 并在该目录初始化，便于无需指定输出目录的快速调用：
 
 ```rust
+# use std::path::Path;
 # use xdows_model_invoker::{ModelInvoker, ModelLibrary, ModelMode};
 # fn example(library: &ModelLibrary) -> xdows_model_invoker::Result<()> {
 let model = ModelInvoker::initialize(library, ModelMode::Adaptive, None)?;
@@ -128,6 +145,8 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
 ```
 
+单元测试会校验内置部署集的完整性：共 12 个资产（8 个 ONNX + 4 个清单）、每个模式各自携带所需的推荐阈值清单，并断言 Pro 清单声明的分支文件名与内置的分支模型逐一对得上。
+
 准备好原生运行库与 PE 样本后，可运行四模式真实冒烟测试（模型已内置，无需设置模型目录）：
 
 ```powershell
@@ -140,4 +159,3 @@ cargo test --test native_smoke -- --ignored --nocapture
 ## 许可证
 
 [MIT](LICENSE.txt), Copyright (c) 2026 XTY64XTY.
-

@@ -60,18 +60,20 @@ impl ModelLibrary {
     /// Existing files are left in place when their size matches the embedded
     /// asset, so repeated calls are idempotent and never overwrite a model that
     /// a caller placed deliberately. This mirrors the C#
-    /// `ModelInvoker.EnsureModelAvailable` flow, which extracts the embedded
-    /// resources next to the assembly on first use. The native library does not
-    /// need to be loaded to call this function.
+    /// `ModelInvoker.EnsureModelAvailable` flow, which resolves the model files
+    /// from the `Models` directory next to the assembly. The native library does
+    /// not need to be loaded to call this function.
     pub fn ensure_models(directory: &Path, mode: ModelMode) -> Result<()> {
         write_assets(directory, models_for_mode(mode))
     }
 
-    /// Writes all seven embedded model files into `directory`.
+    /// Writes the complete embedded model set into `directory`.
     ///
-    /// Useful when a deployment wants every model available up front instead of
-    /// extracting them per mode. Existing files are preserved like
-    /// [`ensure_models`](Self::ensure_models).
+    /// That is the 8 ONNX files and the 4 JSON manifests — the fusion model and
+    /// the five stacking branches, plus the Pro manifest and the recommended
+    /// thresholds for Standard, Flash, and Pro. Useful when a deployment wants
+    /// every model available up front instead of extracting them per mode.
+    /// Existing files are preserved like [`ensure_models`](Self::ensure_models).
     pub fn ensure_all_models(directory: &Path) -> Result<()> {
         write_assets(directory, crate::models::ALL)
     }
@@ -179,13 +181,13 @@ pub struct ModelInvoker {
 impl ModelInvoker {
     /// Initializes one of the four Xdows-Model modes.
     ///
-    /// When `model_directory` is `Some(dir)`, the embedded model files for `mode`
-    /// are first extracted into `dir` (overriding only missing or mismatched
-    /// files), and `dir` is passed to the native library. When it is `None`,
-    /// the models are extracted into a per-user cache directory under the
-    /// system temp folder and that directory is passed instead. This mirrors
-    /// the C# `ModelInvoker.Initialize`/`EnsureModelAvailable` flow, which
-    /// materializes the embedded resources next to the assembly on first use.
+    /// When `model_directory` is `Some(dir)`, the embedded model files and
+    /// manifests for `mode` are first extracted into `dir` (overriding only
+    /// missing or mismatched files), and `dir` is passed to the native library.
+    /// When it is `None`, the models are extracted into a per-user cache
+    /// directory under the system temp folder and that directory is passed
+    /// instead. This mirrors the C# `ModelInvoker.Initialize` contract, where
+    /// the caller supplies the `Models` directory holding the deployment set.
     pub fn initialize(
         library: &ModelLibrary,
         mode: ModelMode,
