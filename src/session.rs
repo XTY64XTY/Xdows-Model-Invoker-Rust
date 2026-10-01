@@ -1,4 +1,4 @@
-use crate::ffi::{canonical_library_path, encode_path, NativeApi, RawScanResult};
+use crate::ffi::{canonical_library_path, encode_path, NativeApi, RawScanResult, RawSessionInfo};
 use crate::models::{for_mode as models_for_mode, ModelAsset};
 use crate::{Error, ModelMode, NativeStatus, Result, NATIVE_LIBRARY_FILE_NAME};
 use std::cell::Cell;
@@ -9,7 +9,19 @@ use std::io::Write;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+const PREDICT_SYMBOL: &str = "XdowsModelNativePredict";
+const GET_SESSION_INFO_SYMBOL: &str = "XdowsModelNativeGetSessionInfo";
+const CONFIGURE_THRESHOLDS_SYMBOL: &str = "XdowsModelNativeConfigureThresholds";
+
+/// The fixed thresholds last handed to the native library.
+///
+/// The ABI exposes fixed thresholds as process-level configuration, so this is
+/// process-wide rather than per-session. It exists so that
+/// [`ModelLibrary::set_auto_threshold_selection`] can flip the manifest switch
+/// without silently resetting the thresholds a caller already configured.
+static CURRENT_FIXED_THRESHOLDS: Mutex<[f32; 3]> = Mutex::new([92.0, 96.0, 94.0]);
 
 /// A loaded `Xdows-Model-Native.dll` and its validated function table.
 ///
@@ -76,6 +88,64 @@ impl ModelLibrary {
     /// Existing files are preserved like [`ensure_models`](Self::ensure_models).
     pub fn ensure_all_models(directory: &Path) -> Result<()> {
         write_assets(directory, crate::models::ALL)
+    }
+
+    /// Sets the process-level decision thresholds for sessions created afterwards.
+    ///
+    /// Mirrors the managed `ModelInvoker.ConfigureThresholds`: the three fixed
+    /// thresholds become the malware boundary, and automatic manifest selection
+    /// is turned on or off at the same time. Call this before
+    /// [`ModelInvoker::initialize`] so the new values are picked up.
+    pub fn configure_thresholds(&self, thresholds: &Thresholds) -> Result<()> {
+        let configure = self
+            .api
+            .configure_thresholds()
+            .ok_or(Error::MissingSymbol {
+                symbol: CONFIGURE_THRESHOLDS_SYMBOL,
+                windows_error: 0,
+            })?;
+
+        let fixed = [
+            thresholds.fixed_standard,
+            thresholds.fixed_flash,
+            thresholds.fixed_pro,
+        ];
+        let status = unsafe { configure(fixed.as_ptr(), i32::from(thresholds.auto_selection)) };
+
+        let status = NativeStatus::from_code(status);
+        if status != NativeStatus::Ok {
+            return Err(Error::NativeCall {
+                operation: "configure thresholds",
+                status,
+                message: None,
+            });
+        }
+
+        if let Ok(mut current) = CURRENT_FIXED_THRESHOLDS.lock() {
+            *current = fixed;
+        }
+        Ok(())
+    }
+
+    /// Turns automatic threshold-manifest selection on or off.
+    ///
+    /// The fixed thresholds configured by the last
+    /// [`configure_thresholds`](Self::configure_thresholds) call are preserved.
+    pub fn set_auto_threshold_selection(&self, enabled: bool) -> Result<()> {
+        let fixed = CURRENT_FIXED_THRESHOLDS
+            .lock()
+            .map(|current| *current)
+            .unwrap_or([92.0, 96.0, 94.0]);
+
+        self.configure_thresholds(&Thresholds {
+            fixed_standard: fixed[0],
+            fixed_flash: fixed[1],
+            fixed_pro: fixed[2],
+            recommended_standard: fixed[0],
+            recommended_flash: fixed[1],
+            recommended_pro: fixed[2],
+            auto_selection: enabled,
+        })
     }
 }
 
@@ -164,6 +234,48 @@ pub struct ScanResult {
     pub probability: f32,
     /// The optional detection name produced for a threat.
     pub detection_name: Option<String>,
+}
+
+/// The decision thresholds in effect for an initialized session.
+///
+/// A probability at or above the fixed threshold yields
+/// [`ScanVerdict::Malware`]; between the recommended and fixed thresholds it
+/// yields [`ScanVerdict::Suspicious`]; below the recommended threshold it
+/// yields [`ScanVerdict::Clean`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Thresholds {
+    /// Fixed (malware) threshold for Standard, in percent.
+    pub fixed_standard: f32,
+    /// Fixed (malware) threshold for Flash, in percent.
+    pub fixed_flash: f32,
+    /// Fixed (malware) threshold for Pro, in percent.
+    pub fixed_pro: f32,
+    /// Recommended (suspicious) threshold for Standard, in percent.
+    pub recommended_standard: f32,
+    /// Recommended (suspicious) threshold for Flash, in percent.
+    pub recommended_flash: f32,
+    /// Recommended (suspicious) threshold for Pro, in percent.
+    pub recommended_pro: f32,
+    /// Whether recommended thresholds were taken from the model's
+    /// `<model>.threshold.json`. When false, the suspicious band is empty and
+    /// classification degrades to two tiers.
+    pub auto_selection: bool,
+}
+
+impl Default for Thresholds {
+    /// The values the native library starts with: 92 / 96 / 94 percent fixed,
+    /// with automatic manifest selection enabled.
+    fn default() -> Self {
+        Self {
+            fixed_standard: 92.0,
+            fixed_flash: 96.0,
+            fixed_pro: 94.0,
+            recommended_standard: 92.0,
+            recommended_flash: 96.0,
+            recommended_pro: 94.0,
+            auto_selection: true,
+        }
+    }
 }
 
 /// An initialized Xdows-Model session.
@@ -266,6 +378,101 @@ impl ModelInvoker {
             )
         };
 
+        self.interpret_result("scan", call_status, raw_result)
+    }
+
+    /// Runs inference on a caller-supplied feature vector.
+    ///
+    /// Mirrors the managed `ModelInvoker.PredictWithMlNet`: no file is read and
+    /// no feature extraction happens, so the caller owns the feature layout.
+    /// The vector length selects the model input — `299` for Standard, `68` for
+    /// Flash, and for Pro either the hybrid vector (`519` legacy or `5143`,
+    /// which the native library splits across the five stacking branches) or the
+    /// fusion vector (the branch count, `4` or `5`). Adaptive sessions reject
+    /// this call, matching the managed API, which only predicts through its
+    /// Standard session.
+    pub fn predict(&self, features: &[f32]) -> Result<ScanResult> {
+        let predict = self.library.api.predict().ok_or(Error::MissingSymbol {
+            symbol: PREDICT_SYMBOL,
+            windows_error: 0,
+        })?;
+
+        let feature_count = i32::try_from(features.len()).map_err(|_| Error::NativeCall {
+            operation: "predict",
+            status: NativeStatus::InvalidArgument,
+            message: None,
+        })?;
+
+        let mut raw_result = RawScanResult::default();
+        let call_status = unsafe {
+            predict(
+                self.session.as_ptr(),
+                features.as_ptr(),
+                feature_count,
+                &mut raw_result,
+            )
+        };
+
+        self.interpret_result("predict", call_status, raw_result)
+    }
+
+    /// Returns the decision thresholds currently in effect for this session.
+    ///
+    /// Fixed thresholds come from the process-level configuration set through
+    /// [`ModelLibrary::configure_thresholds`]; recommended thresholds come from
+    /// the model's `<model>.threshold.json` when automatic selection is on, and
+    /// otherwise equal the fixed thresholds.
+    pub fn thresholds(&self) -> Result<Thresholds> {
+        let get_session_info = self
+            .library
+            .api
+            .get_session_info()
+            .ok_or(Error::MissingSymbol {
+                symbol: GET_SESSION_INFO_SYMBOL,
+                windows_error: 0,
+            })?;
+
+        let mut raw = RawSessionInfo::default();
+        let status = unsafe { get_session_info(self.session.as_ptr(), &mut raw) };
+
+        let status = NativeStatus::from_code(status);
+        if status != NativeStatus::Ok {
+            return Err(Error::NativeCall {
+                operation: "get session info",
+                status,
+                message: None,
+            });
+        }
+
+        // The library allocates the model path with CoTaskMemAlloc and expects it
+        // back through its own free function. This crate does not surface the
+        // path, so release it here rather than leak it.
+        unsafe {
+            self.library.api.copy_and_free_string(raw.model_path);
+        }
+
+        Ok(Thresholds {
+            fixed_standard: raw.fixed_standard,
+            fixed_flash: raw.fixed_flash,
+            fixed_pro: raw.fixed_pro,
+            recommended_standard: raw.recommended_standard,
+            recommended_flash: raw.recommended_flash,
+            recommended_pro: raw.recommended_pro,
+            auto_selection: raw.auto_threshold_selection != 0,
+        })
+    }
+
+    /// Validates a raw ABI result and converts it into a [`ScanResult`].
+    ///
+    /// Shared by [`scan_file`](Self::scan_file) and [`predict`](Self::predict)
+    /// because both cross the same ABI boundary and must apply the same
+    /// contract checks.
+    fn interpret_result(
+        &self,
+        operation: &'static str,
+        call_status: i32,
+        raw_result: RawScanResult,
+    ) -> Result<ScanResult> {
         let detection_name = unsafe {
             self.library
                 .api
@@ -280,7 +487,7 @@ impl ModelInvoker {
         let call_status = NativeStatus::from_code(call_status);
         if call_status != NativeStatus::Ok {
             return Err(Error::NativeCall {
-                operation: "scan",
+                operation,
                 status: call_status,
                 message: error_message,
             });
@@ -289,7 +496,7 @@ impl ModelInvoker {
         let result_status = NativeStatus::from_code(raw_result.status);
         if result_status != NativeStatus::Ok {
             return Err(Error::NativeCall {
-                operation: "scan",
+                operation,
                 status: result_status,
                 message: error_message,
             });

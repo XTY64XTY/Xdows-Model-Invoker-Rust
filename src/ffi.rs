@@ -28,6 +28,40 @@ impl Default for RawScanResult {
     }
 }
 
+/// The session info layout from `xdows_model_native.h`.
+#[repr(C)]
+pub(crate) struct RawSessionInfo {
+    pub size: i32,
+    pub mode: i32,
+    pub feature_count: i32,
+    pub auto_threshold_selection: i32,
+    pub fixed_standard: f32,
+    pub fixed_flash: f32,
+    pub fixed_pro: f32,
+    pub recommended_standard: f32,
+    pub recommended_flash: f32,
+    pub recommended_pro: f32,
+    pub model_path: *mut u16,
+}
+
+impl Default for RawSessionInfo {
+    fn default() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>() as i32,
+            mode: 0,
+            feature_count: 0,
+            auto_threshold_selection: 0,
+            fixed_standard: 0.0,
+            fixed_flash: 0.0,
+            fixed_pro: 0.0,
+            recommended_standard: 0.0,
+            recommended_flash: 0.0,
+            recommended_pro: 0.0,
+            model_path: std::ptr::null_mut(),
+        }
+    }
+}
+
 #[cfg(windows)]
 type InitializeFn = unsafe extern "system" fn(*const u16, i32, *mut *mut c_void) -> i32;
 #[cfg(windows)]
@@ -36,6 +70,9 @@ type ScanFileFn = unsafe extern "system" fn(*mut c_void, *const u16, *mut RawSca
 type ShutdownFn = unsafe extern "system" fn(*mut c_void);
 #[cfg(windows)]
 type FreeStringFn = unsafe extern "system" fn(*mut u16);
+type ConfigureThresholdsFn = unsafe extern "system" fn(*const f32, i32) -> i32;
+type PredictFn = unsafe extern "system" fn(*mut c_void, *const f32, i32, *mut RawScanResult) -> i32;
+type GetSessionInfoFn = unsafe extern "system" fn(*mut c_void, *mut RawSessionInfo) -> i32;
 
 #[cfg(windows)]
 type ModuleHandle = *mut c_void;
@@ -48,6 +85,9 @@ pub(crate) struct NativeApi {
     scan_file: ScanFileFn,
     shutdown: ShutdownFn,
     free_string: FreeStringFn,
+    configure_thresholds: Option<ConfigureThresholdsFn>,
+    predict: Option<PredictFn>,
+    get_session_info: Option<GetSessionInfoFn>,
 }
 
 #[cfg(not(windows))]
@@ -109,12 +149,43 @@ impl NativeApi {
                 )?)
             };
 
+            // The capability extensions are optional: a library built before they
+            // existed still loads, and only calls that need them report the
+            // missing export.
+            let configure_thresholds = unsafe {
+                resolve_optional(
+                    module,
+                    "XdowsModelNativeConfigureThresholds",
+                    b"XdowsModelNativeConfigureThresholds\0",
+                )
+                .map(|address| std::mem::transmute::<*mut c_void, ConfigureThresholdsFn>(address))
+            };
+            let predict = unsafe {
+                resolve_optional(
+                    module,
+                    "XdowsModelNativePredict",
+                    b"XdowsModelNativePredict\0",
+                )
+                .map(|address| std::mem::transmute::<*mut c_void, PredictFn>(address))
+            };
+            let get_session_info = unsafe {
+                resolve_optional(
+                    module,
+                    "XdowsModelNativeGetSessionInfo",
+                    b"XdowsModelNativeGetSessionInfo\0",
+                )
+                .map(|address| std::mem::transmute::<*mut c_void, GetSessionInfoFn>(address))
+            };
+
             Ok(Self {
                 module,
                 initialize,
                 scan_file,
                 shutdown,
                 free_string,
+                configure_thresholds,
+                predict,
+                get_session_info,
             })
         })();
 
@@ -248,6 +319,42 @@ impl NativeApi {
     pub(crate) unsafe fn copy_and_free_string(&self, _value: *mut u16) -> Option<String> {
         unreachable!("NativeApi cannot be constructed on this platform")
     }
+
+    #[cfg(windows)]
+    /// Returns the optional session-info export, if the loaded library has it.
+    pub(crate) fn get_session_info(&self) -> Option<GetSessionInfoFn> {
+        self.get_session_info
+    }
+
+    #[cfg(not(windows))]
+    /// Non-Windows placeholder for the optional session-info export.
+    pub(crate) fn get_session_info(&self) -> Option<GetSessionInfoFn> {
+        None
+    }
+
+    #[cfg(windows)]
+    /// Returns the optional feature-vector prediction export, if present.
+    pub(crate) fn predict(&self) -> Option<PredictFn> {
+        self.predict
+    }
+
+    #[cfg(not(windows))]
+    /// Non-Windows placeholder for the optional prediction export.
+    pub(crate) fn predict(&self) -> Option<PredictFn> {
+        None
+    }
+
+    #[cfg(windows)]
+    /// Returns the optional process-level threshold configuration export.
+    pub(crate) fn configure_thresholds(&self) -> Option<ConfigureThresholdsFn> {
+        self.configure_thresholds
+    }
+
+    #[cfg(not(windows))]
+    /// Non-Windows placeholder for the optional threshold configuration export.
+    pub(crate) fn configure_thresholds(&self) -> Option<ConfigureThresholdsFn> {
+        None
+    }
 }
 
 #[cfg(windows)]
@@ -279,6 +386,29 @@ unsafe fn resolve(
         })
     } else {
         Ok(address)
+    }
+}
+
+#[cfg(windows)]
+/// Resolves one optional export from a loaded module.
+///
+/// Returns `None` when the library was built before the export existed, so the
+/// crate stays loadable against older native builds.
+///
+/// # Safety
+///
+/// `module` must be a live module handle, and `nul_terminated_symbol` must end
+/// in a NUL byte and remain valid for the duration of the call.
+unsafe fn resolve_optional(
+    module: ModuleHandle,
+    _symbol: &'static str,
+    nul_terminated_symbol: &'static [u8],
+) -> Option<*mut c_void> {
+    let address = unsafe { GetProcAddress(module, nul_terminated_symbol.as_ptr()) };
+    if address.is_null() {
+        None
+    } else {
+        Some(address)
     }
 }
 
@@ -322,7 +452,7 @@ extern "system" {
 
 #[cfg(test)]
 mod tests {
-    use super::RawScanResult;
+    use super::{RawScanResult, RawSessionInfo};
 
     #[test]
     fn raw_result_has_expected_pointer_alignment() {
@@ -332,5 +462,23 @@ mod tests {
             28
         };
         assert_eq!(std::mem::size_of::<RawScanResult>(), expected);
+    }
+
+    #[test]
+    fn raw_session_info_has_expected_pointer_alignment() {
+        // 3 leading i32 + 1 threshold flag i32 + 6 f32, then one pointer.
+        let tail = if cfg!(target_pointer_width = "64") {
+            48
+        } else {
+            40
+        };
+        assert_eq!(std::mem::size_of::<RawSessionInfo>(), tail);
+    }
+
+    #[test]
+    fn raw_session_info_default_declares_its_own_size() {
+        let info = RawSessionInfo::default();
+        assert_eq!(info.size as usize, std::mem::size_of::<RawSessionInfo>());
+        assert!(info.model_path.is_null());
     }
 }

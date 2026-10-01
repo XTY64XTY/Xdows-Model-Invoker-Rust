@@ -15,12 +15,15 @@ pub enum NativeStatus {
     InvalidArgument,
     /// The file selected for scanning does not exist.
     FileNotFound,
-    /// The selected file type is not supported.
+    /// The selected file is not a PE image (or is empty), which the native
+    /// library reports instead of silently classifying it as clean.
     UnsupportedFile,
     /// One or more model files could not be found.
     ModelNotFound,
     /// The native inference implementation failed.
     InternalError,
+    /// The Pro model manifest failed validation.
+    ModelManifestInvalid,
     /// A status from a newer native library that this crate does not know yet.
     Unknown(i32),
 }
@@ -35,6 +38,7 @@ impl NativeStatus {
             3 => Self::UnsupportedFile,
             4 => Self::ModelNotFound,
             5 => Self::InternalError,
+            6 => Self::ModelManifestInvalid,
             value => Self::Unknown(value),
         }
     }
@@ -48,6 +52,7 @@ impl NativeStatus {
             Self::UnsupportedFile => 3,
             Self::ModelNotFound => 4,
             Self::InternalError => 5,
+            Self::ModelManifestInvalid => 6,
             Self::Unknown(value) => value,
         }
     }
@@ -59,9 +64,10 @@ impl fmt::Display for NativeStatus {
             Self::Ok => formatter.write_str("ok"),
             Self::InvalidArgument => formatter.write_str("invalid argument"),
             Self::FileNotFound => formatter.write_str("file not found"),
-            Self::UnsupportedFile => formatter.write_str("unsupported file"),
+            Self::UnsupportedFile => formatter.write_str("unsupported file type"),
             Self::ModelNotFound => formatter.write_str("model not found"),
             Self::InternalError => formatter.write_str("internal native error"),
+            Self::ModelManifestInvalid => formatter.write_str("pro model manifest rejected"),
             Self::Unknown(code) => write!(formatter, "unknown native status {code}"),
         }
     }
@@ -175,5 +181,35 @@ impl StdError for Error {
             Self::Io { source, .. } => Some(source),
             _ => None,
         }
+    }
+}
+
+impl Error {
+    /// The native status behind this error, when it came from a native call.
+    ///
+    /// Errors raised before the native library is reached (path encoding, I/O,
+    /// library loading) have no status and return `None`.
+    pub fn native_status(&self) -> Option<NativeStatus> {
+        match self {
+            Self::NativeCall { status, .. } => Some(*status),
+            _ => None,
+        }
+    }
+
+    /// Whether the failure means "this file is not a PE image".
+    ///
+    /// The native library reports a non-PE or empty file as
+    /// [`NativeStatus::UnsupportedFile`] rather than a clean verdict, matching
+    /// the managed library's `NotSupportedException`. Callers driving a scan
+    /// loop should treat this as *not a threat* instead of an infrastructure
+    /// failure.
+    pub fn is_unsupported_file(&self) -> bool {
+        matches!(
+            self,
+            Self::NativeCall {
+                status: NativeStatus::UnsupportedFile,
+                ..
+            }
+        )
     }
 }
